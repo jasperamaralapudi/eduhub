@@ -86,7 +86,16 @@ exports.createCourse = async (req, res) => {
       });
     }
 
+    // Add instructor ID to course data
     req.body.instructor = req.user.id;
+    
+    // Set default values
+    req.body.status = 'draft';
+    req.body.isPublished = false;
+    req.body.studentsEnrolled = 0;
+    req.body.rating = { average: 0, count: 0 };
+    req.body.createdAt = new Date();
+    req.body.updatedAt = new Date();
 
     const course = await Course.create(req.body);
 
@@ -336,6 +345,267 @@ exports.getMyCourses = async (req, res) => {
     });
   } catch (error) {
     console.error('Get my courses error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// @desc    Get instructor's courses
+// @route   GET /api/courses/instructor/my-courses
+// @access  Private/Instructor
+exports.getInstructorCourses = async (req, res) => {
+  try {
+    const courses = await Course.find({ instructor: req.user.id })
+      .populate('instructor', 'name avatar')
+      .sort('-createdAt');
+
+    // Get enrollment stats for each course
+    const coursesWithStats = await Promise.all(
+      courses.map(async (course) => {
+        const enrolledStudents = await User.countDocuments({
+          'enrolledCourses.courseId': course._id
+        });
+
+        const completedStudents = await User.countDocuments({
+          'enrolledCourses.courseId': course._id,
+          'enrolledCourses.progress': 100
+        });
+
+        return {
+          ...course.toObject(),
+          enrollmentStats: {
+            enrolled: enrolledStudents,
+            completed: completedStudents,
+            completionRate: enrolledStudents > 0 ? Math.round((completedStudents / enrolledStudents) * 100) : 0
+          }
+        };
+      })
+    );
+
+    res.status(200).json({
+      success: true,
+      count: courses.length,
+      data: coursesWithStats
+    });
+  } catch (error) {
+    console.error('Get instructor courses error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// @desc    Get course analytics for instructor
+// @route   GET /api/courses/:id/analytics
+// @access  Private/Instructor
+exports.getCourseAnalytics = async (req, res) => {
+  try {
+    const course = await Course.findById(req.params.id);
+
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        message: 'Course not found'
+      });
+    }
+
+    // Check if user is the instructor
+    if (course.instructor.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to view course analytics'
+      });
+    }
+
+    // Get enrolled students with their progress
+    const enrolledStudents = await User.find({
+      'enrolledCourses.courseId': req.params.id
+    }).select('name email avatar enrolledCourses');
+
+    const studentsData = enrolledStudents.map(student => {
+      const enrollment = student.enrolledCourses.find(
+        e => e.courseId.toString() === req.params.id
+      );
+      return {
+        _id: student._id,
+        name: student.name,
+        email: student.email,
+        avatar: student.avatar,
+        enrolledAt: enrollment.enrolledAt,
+        progress: enrollment.progress || 0,
+        isCompleted: enrollment.progress === 100
+      };
+    });
+
+    // Calculate analytics
+    const totalStudents = studentsData.length;
+    const completedStudents = studentsData.filter(s => s.isCompleted).length;
+    const averageProgress = totalStudents > 0 
+      ? Math.round(studentsData.reduce((sum, s) => sum + s.progress, 0) / totalStudents)
+      : 0;
+
+    // Progress distribution
+    const progressRanges = {
+      '0-25': studentsData.filter(s => s.progress >= 0 && s.progress < 25).length,
+      '25-50': studentsData.filter(s => s.progress >= 25 && s.progress < 50).length,
+      '50-75': studentsData.filter(s => s.progress >= 50 && s.progress < 75).length,
+      '75-100': studentsData.filter(s => s.progress >= 75 && s.progress <= 100).length,
+    };
+
+    res.status(200).json({
+      success: true,
+      data: {
+        course: {
+          title: course.title,
+          createdAt: course.createdAt,
+          lastUpdated: course.updatedAt,
+          totalLessons: course.totalLessons || 0,
+          rating: course.rating
+        },
+        stats: {
+          totalStudents,
+          completedStudents,
+          completionRate: totalStudents > 0 ? Math.round((completedStudents / totalStudents) * 100) : 0,
+          averageProgress
+        },
+        progressDistribution: progressRanges,
+        students: studentsData,
+        recentEnrollments: studentsData
+          .sort((a, b) => new Date(b.enrolledAt) - new Date(a.enrolledAt))
+          .slice(0, 10)
+      }
+    });
+  } catch (error) {
+    console.error('Get course analytics error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// @desc    Publish/Unpublish course
+// @route   PUT /api/courses/:id/publish
+// @access  Private/Instructor
+exports.toggleCoursePublication = async (req, res) => {
+  try {
+    const course = await Course.findById(req.params.id);
+
+    if (!course) {
+      return res.status(404).json({
+        success: false,
+        message: 'Course not found'
+      });
+    }
+
+    // Check ownership
+    if (course.instructor.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Not authorized to publish this course'
+      });
+    }
+
+    // Toggle publication status
+    const isPublished = !course.isPublished;
+    const status = isPublished ? 'published' : 'draft';
+
+    const updatedCourse = await Course.findByIdAndUpdate(
+      req.params.id,
+      { 
+        isPublished,
+        status,
+        publishedAt: isPublished ? new Date() : null,
+        updatedAt: new Date()
+      },
+      { new: true }
+    );
+
+    res.status(200).json({
+      success: true,
+      message: `Course ${isPublished ? 'published' : 'unpublished'} successfully`,
+      data: updatedCourse
+    });
+  } catch (error) {
+    console.error('Toggle publication error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
+  }
+};
+
+// @desc    Get instructor dashboard stats
+// @route   GET /api/courses/instructor/stats
+// @access  Private/Instructor
+exports.getInstructorStats = async (req, res) => {
+  try {
+    // Get instructor's courses
+    const courses = await Course.find({ instructor: req.user.id });
+    const courseIds = courses.map(course => course._id);
+
+    // Calculate stats
+    const totalCourses = courses.length;
+    const publishedCourses = courses.filter(course => course.isPublished).length;
+    
+    // Get total students across all courses
+    const enrollments = await User.aggregate([
+      { $unwind: '$enrolledCourses' },
+      { $match: { 'enrolledCourses.courseId': { $in: courseIds } } },
+      { $group: { _id: null, totalStudents: { $sum: 1 } } }
+    ]);
+
+    const totalStudents = enrollments.length > 0 ? enrollments[0].totalStudents : 0;
+
+    // Get completed enrollments
+    const completedEnrollments = await User.aggregate([
+      { $unwind: '$enrolledCourses' },
+      { $match: { 
+        'enrolledCourses.courseId': { $in: courseIds },
+        'enrolledCourses.progress': 100 
+      } },
+      { $group: { _id: null, completedStudents: { $sum: 1 } } }
+    ]);
+
+    const completedStudents = completedEnrollments.length > 0 ? completedEnrollments[0].completedStudents : 0;
+
+    // Calculate average rating
+    const avgRating = courses.length > 0 
+      ? courses.reduce((sum, course) => sum + (course.rating?.average || 0), 0) / courses.length
+      : 0;
+
+    // Recent enrollments
+    const recentEnrollments = await User.aggregate([
+      { $unwind: '$enrolledCourses' },
+      { $match: { 'enrolledCourses.courseId': { $in: courseIds } } },
+      { $sort: { 'enrolledCourses.enrolledAt': -1 } },
+      { $limit: 10 },
+      {
+        $lookup: {
+          from: 'courses',
+          localField: 'enrolledCourses.courseId',
+          foreignField: '_id',
+          as: 'course'
+        }
+      },
+      {
+        $project: {
+          name: 1,
+          email: 1,
+          avatar: 1,
+          enrolledAt: '$enrolledCourses.enrolledAt',
+          progress: '$enrolledCourses.progress',
+          courseName: { $arrayElemAt: ['$course.title', 0] }
+        }
+      }
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        stats: {
+          totalCourses,
+          publishedCourses,
+          totalStudents,
+          completedStudents,
+          averageRating: Math.round(avgRating * 10) / 10
+        },
+        recentEnrollments
+      }
+    });
+  } catch (error) {
+    console.error('Get instructor stats error:', error);
     res.status(500).json({ success: false, message: 'Server error' });
   }
 };
